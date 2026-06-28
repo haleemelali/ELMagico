@@ -1,0 +1,1197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color-scheme: light;
+      background: #f7f4ec;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #f7f4ec;
+    }
+
+    body {
+      min-height: 100dvh;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="scene" role="img" aria-label="Two players passing, shooting, and returning a basketball"></canvas>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const canvas = document.getElementById("scene");
+      const ctx = canvas.getContext("2d", { alpha: false });
+
+      const TAU = Math.PI * 2;
+      const G = 9.81;
+      const FIXED_DT = 1 / 120;
+      const BALL_RADIUS = 0.12;
+      const BALL_MASS = 0.625;
+      const FLOOR_RESTITUTION = 0.72;
+      const RIM_RESTITUTION = 0.68;
+      const BOARD_RESTITUTION = 0.62;
+
+      const palette = {
+        skyTop: "#fbfaf5",
+        skyBottom: "#f1eee5",
+        wallLine: "#dedbd2",
+        court: "#dca866",
+        courtLight: "#e8bb7b",
+        courtDark: "#c98f4d",
+        courtInk: "rgba(113, 72, 35, 0.48)",
+        navy: "#18324a",
+        blue: "#3276a8",
+        blueLight: "#6fa7c8",
+        coral: "#d95e4f",
+        coralLight: "#ed8b76",
+        skinA: "#8d5d43",
+        skinB: "#c88d65",
+        white: "#fffdfa",
+        dark: "#17232c",
+        rim: "#d75a2a",
+        metal: "#7d8990",
+        ball: "#dc742d",
+        ballDark: "#6f321d",
+        shadow: "rgba(37, 31, 24, 0.16)"
+      };
+
+      const view = {
+        width: 0,
+        height: 0,
+        dpr: 1,
+        scale: 1,
+        offsetX: 0,
+        groundY: 0,
+        worldW: 14.5
+      };
+
+      const court = {
+        hoopX: 12.8,
+        rimY: 3.05,
+        rimHalfWidth: 0.23,
+        rimTube: 0.035,
+        boardX: 13.38,
+        boardBottom: 2.72,
+        boardTop: 4.02,
+        baseX: 14.04
+      };
+
+      const playerA = {
+        baseX: 3.45,
+        x: 3.45,
+        facing: 1,
+        skin: palette.skinA,
+        jersey: palette.blue,
+        jerseyLight: palette.blueLight,
+        shorts: palette.navy,
+        shoe: palette.white
+      };
+
+      const playerB = {
+        baseX: 8.5,
+        x: 8.5,
+        facing: 1,
+        skin: palette.skinB,
+        jersey: palette.coral,
+        jerseyLight: palette.coralLight,
+        shorts: "#9f413d",
+        shoe: palette.white
+      };
+
+      const ball = {
+        x: 0,
+        y: 0,
+        prevX: 0,
+        prevY: 0,
+        vx: 0,
+        vy: 0,
+        angle: 0,
+        spin: 0,
+        mode: "free",
+        flight: "dribble"
+      };
+
+      let phase = "dribble";
+      let phaseTime = 0;
+      let shotClock = 0;
+      let passDuration = 0.72;
+      let scored = false;
+      let dribbleHits = 0;
+      let netEnergy = 0;
+      let netClock = 0;
+      let accumulator = 0;
+      let previousTimestamp = performance.now();
+      let backgroundGrain = [];
+
+      const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+      const lerp = (a, b, t) => a + (b - a) * t;
+      const smooth = t => {
+        t = clamp(t, 0, 1);
+        return t * t * (3 - 2 * t);
+      };
+      const easeOut = t => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+      const length = (x, y) => Math.hypot(x, y);
+
+      function worldToScreen(x, y) {
+        return {
+          x: view.offsetX + x * view.scale,
+          y: view.groundY - y * view.scale
+        };
+      }
+
+      function resize() {
+        view.width = window.innerWidth;
+        view.height = window.innerHeight;
+        view.dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+        canvas.width = Math.round(view.width * view.dpr);
+        canvas.height = Math.round(view.height * view.dpr);
+        canvas.style.width = view.width + "px";
+        canvas.style.height = view.height + "px";
+        ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+
+        const aspect = view.width / Math.max(1, view.height);
+        view.worldW = aspect < 0.72 ? 10.2 : aspect < 1.18 ? 12 : 14.5;
+        view.scale = Math.min(
+          view.width / view.worldW,
+          view.height / 5.7
+        );
+        view.offsetX = (view.width - view.worldW * view.scale) * 0.5;
+        view.groundY = clamp(
+          view.height * (aspect < 0.72 ? 0.72 : 0.82),
+          4.25 * view.scale + 18,
+          view.height - 22
+        );
+
+        court.hoopX = view.worldW - 1.7;
+        court.boardX = court.hoopX + 0.58;
+        court.baseX = Math.min(view.worldW - 0.18, court.hoopX + 1.35);
+
+        playerB.baseX = court.hoopX - Math.min(4.25, view.worldW * 0.34);
+        playerA.baseX = Math.max(1.25, playerB.baseX - Math.min(4.25, view.worldW * 0.31));
+        playerA.x = playerA.baseX;
+        playerB.x = playerB.baseX;
+
+        const count = Math.max(18, Math.floor(view.width * view.height / 38000));
+        backgroundGrain = Array.from({ length: count }, (_, i) => ({
+          x: ((i * 97.31) % 1000) / 1000,
+          y: ((i * 61.73 + 111) % 1000) / 1000,
+          r: 0.4 + ((i * 17) % 9) * 0.08
+        }));
+
+        resetScene();
+      }
+
+      function setBall(x, y, vx = 0, vy = 0) {
+        ball.x = x;
+        ball.y = y;
+        ball.prevX = x;
+        ball.prevY = y;
+        ball.vx = vx;
+        ball.vy = vy;
+      }
+
+      function resetScene() {
+        phase = "dribble";
+        phaseTime = 0;
+        shotClock = 0;
+        scored = false;
+        dribbleHits = 0;
+        netEnergy = 0;
+        netClock = 0;
+        playerA.x = playerA.baseX;
+        playerB.x = playerB.baseX;
+        ball.mode = "free";
+        ball.flight = "dribble";
+        ball.angle = 0;
+        ball.spin = -2.5;
+        setBall(playerA.x + 0.34, 1.24, 0, -3.15);
+      }
+
+      function jumpOffset(time) {
+        if (time < 0 || time > 0.72) return 0;
+        return Math.max(0, 3.55 * time - 0.5 * G * time * time);
+      }
+
+      function getPose(player, role) {
+        const isA = role === "A";
+        let rootX = player.x;
+        let jump = 0;
+        let crouch = 0;
+        let lean = 0;
+        let stride = 0;
+        let armMode = "rest";
+        let handFocus = null;
+
+        if (isA) {
+          if (phase === "dribble") {
+            const active = clamp(phaseTime / 1.15, 0, 1);
+            crouch = 0.14 + 0.08 * Math.sin(phaseTime * 8.5) * active;
+            lean = 0.05;
+            stride = 0.05 * Math.sin(phaseTime * 4.2);
+            armMode = phaseTime > 1.12 ? "passLoad" : "dribble";
+            handFocus = { x: ball.x, y: ball.y + 0.06 };
+          } else if (phase === "pass") {
+            crouch = 0.12 * (1 - smooth(phaseTime / 0.45));
+            lean = 0.09 * (1 - smooth(phaseTime / 0.55));
+            armMode = "passFollow";
+          } else if (phase === "gather" || phase === "jump" || phase === "shot") {
+            armMode = phase === "gather" ? "ready" : "watch";
+            stride = 0.04 * Math.sin(phaseTime * 2.5);
+          } else if (phase === "return") {
+            const desired = clamp(ball.x - 0.38, player.baseX - 0.55, player.baseX + 0.75);
+            rootX = lerp(player.x, desired, 0.16);
+            player.x = rootX;
+            const moving = clamp(Math.abs(desired - player.x) * 6, 0, 1);
+            stride = Math.sin(phaseTime * 7) * 0.24 * moving;
+            lean = -0.02;
+            armMode = "receiveLow";
+            handFocus = { x: ball.x, y: ball.y };
+          } else {
+            const settle = smooth(phaseTime / 0.55);
+            rootX = lerp(player.x, player.baseX, settle);
+            armMode = "catch";
+            handFocus = { x: ball.x, y: ball.y };
+          }
+        } else {
+          if (phase === "dribble") {
+            crouch = 0.04 + 0.025 * Math.sin(phaseTime * 2.6);
+            armMode = phaseTime > 0.72 ? "ready" : "rest";
+          } else if (phase === "pass") {
+            crouch = 0.08 + 0.06 * smooth(phaseTime / passDuration);
+            lean = -0.035;
+            armMode = "catch";
+            handFocus = { x: ball.x, y: ball.y };
+          } else if (phase === "gather") {
+            const gather = smooth(phaseTime / 0.62);
+            crouch = 0.28 * Math.sin(gather * Math.PI);
+            lean = 0.06 * gather;
+            armMode = "ball";
+            handFocus = { x: ball.x, y: ball.y };
+          } else if (phase === "jump" || phase === "shot") {
+            jump = jumpOffset(shotClock);
+            crouch = shotClock < 0.12 ? 0.24 * (1 - shotClock / 0.12) : 0;
+            lean = 0.035;
+            armMode = phase === "jump" ? "ballHigh" : "followThrough";
+            handFocus = phase === "jump" ? { x: ball.x, y: ball.y } : null;
+          } else if (phase === "return") {
+            armMode = "watch";
+            const settle = clamp((phaseTime - 0.4) / 1.5, 0, 1);
+            stride = 0.08 * Math.sin(phaseTime * 4) * (1 - settle);
+          } else {
+            armMode = "rest";
+          }
+        }
+
+        const hip = {
+          x: rootX + lean * 0.12,
+          y: 0.91 + jump - crouch * 0.38
+        };
+        const shoulder = {
+          x: rootX + lean,
+          y: 1.49 + jump - crouch * 0.54
+        };
+        const head = {
+          x: shoulder.x + lean * 0.42,
+          y: shoulder.y + 0.31
+        };
+
+        const rearFoot = {
+          x: rootX - 0.17 - stride,
+          y: jump > 0 ? jump * 0.2 + 0.03 : 0.035
+        };
+        const frontFoot = {
+          x: rootX + 0.18 + stride,
+          y: jump > 0 ? jump * 0.13 + 0.03 : 0.035
+        };
+
+        let leftHand = {
+          x: shoulder.x - 0.18,
+          y: shoulder.y - 0.48
+        };
+        let rightHand = {
+          x: shoulder.x + 0.2,
+          y: shoulder.y - 0.45
+        };
+
+        if (armMode === "dribble") {
+          rightHand = {
+            x: lerp(shoulder.x + 0.25, handFocus.x, 0.72),
+            y: clamp(handFocus.y, 0.65, shoulder.y - 0.02)
+          };
+          leftHand = { x: shoulder.x - 0.25, y: shoulder.y - 0.23 };
+        } else if (armMode === "passLoad") {
+          const p = smooth((phaseTime - 1.12) / 0.38);
+          const center = {
+            x: shoulder.x + lerp(0.14, 0.28, p),
+            y: shoulder.y - lerp(0.3, 0.08, p)
+          };
+          leftHand = { x: center.x - 0.08, y: center.y + 0.03 };
+          rightHand = { x: center.x + 0.08, y: center.y - 0.03 };
+        } else if (armMode === "passFollow") {
+          const p = easeOut(phaseTime / 0.24);
+          leftHand = {
+            x: shoulder.x + lerp(0.16, 0.52, p),
+            y: shoulder.y + lerp(-0.08, 0.03, p)
+          };
+          rightHand = {
+            x: shoulder.x + lerp(0.24, 0.61, p),
+            y: shoulder.y + lerp(-0.13, -0.02, p)
+          };
+        } else if (armMode === "ready" || armMode === "catch") {
+          const target = handFocus || { x: shoulder.x + 0.48, y: shoulder.y - 0.1 };
+          const reach = armMode === "catch" ? 0.82 : 0.65;
+          leftHand = {
+            x: lerp(shoulder.x + 0.15, target.x - 0.08, reach),
+            y: lerp(shoulder.y - 0.28, target.y + 0.04, reach)
+          };
+          rightHand = {
+            x: lerp(shoulder.x + 0.24, target.x + 0.08, reach),
+            y: lerp(shoulder.y - 0.25, target.y - 0.03, reach)
+          };
+        } else if (armMode === "ball") {
+          leftHand = { x: ball.x - 0.09, y: ball.y + 0.02 };
+          rightHand = { x: ball.x + 0.09, y: ball.y - 0.02 };
+        } else if (armMode === "ballHigh") {
+          leftHand = { x: ball.x - 0.08, y: ball.y + 0.01 };
+          rightHand = { x: ball.x + 0.08, y: ball.y - 0.01 };
+        } else if (armMode === "followThrough") {
+          const p = smooth(clamp((shotClock - 0.2) / 0.34, 0, 1));
+          leftHand = {
+            x: shoulder.x + lerp(0.23, 0.39, p),
+            y: shoulder.y + lerp(0.28, 0.47, p)
+          };
+          rightHand = {
+            x: shoulder.x + lerp(0.33, 0.49, p),
+            y: shoulder.y + lerp(0.34, 0.54, p)
+          };
+        } else if (armMode === "watch") {
+          leftHand = { x: shoulder.x - 0.17, y: shoulder.y - 0.32 };
+          rightHand = { x: shoulder.x + 0.24, y: shoulder.y - 0.24 };
+        } else if (armMode === "receiveLow") {
+          const target = handFocus || { x: rootX + 0.36, y: 0.68 };
+          leftHand = {
+            x: lerp(shoulder.x, target.x - 0.09, 0.72),
+            y: lerp(shoulder.y - 0.3, target.y + 0.05, 0.78)
+          };
+          rightHand = {
+            x: lerp(shoulder.x + 0.18, target.x + 0.09, 0.75),
+            y: lerp(shoulder.y - 0.28, target.y - 0.02, 0.8)
+          };
+        }
+
+        return {
+          rootX,
+          jump,
+          crouch,
+          lean,
+          hip,
+          shoulder,
+          head,
+          rearFoot,
+          frontFoot,
+          leftHand,
+          rightHand
+        };
+      }
+
+      function handCenter(pose) {
+        return {
+          x: (pose.leftHand.x + pose.rightHand.x) * 0.5,
+          y: (pose.leftHand.y + pose.rightHand.y) * 0.5
+        };
+      }
+
+      function releasePass() {
+        phase = "pass";
+        phaseTime = 0;
+        const pose = getPose(playerA, "A");
+        const start = handCenter(pose);
+        const target = { x: playerB.x - 0.24, y: 1.33 };
+        passDuration = clamp((target.x - start.x) / 5.6, 0.58, 0.78);
+        ball.mode = "free";
+        ball.flight = "pass";
+        setBall(start.x, start.y);
+        ball.vx = (target.x - start.x) / passDuration;
+        ball.vy = (target.y - start.y + 0.5 * G * passDuration * passDuration) / passDuration;
+        ball.spin = -ball.vx / BALL_RADIUS * 0.28;
+      }
+
+      function beginGather() {
+        phase = "gather";
+        phaseTime = 0;
+        ball.mode = "heldB";
+        ball.flight = "held";
+      }
+
+      function beginJump() {
+        phase = "jump";
+        phaseTime = 0;
+        shotClock = 0;
+        ball.mode = "heldB";
+      }
+
+      function releaseShot() {
+        const pose = getPose(playerB, "B");
+        const start = handCenter(pose);
+        const target = { x: court.hoopX, y: court.rimY + 0.025 };
+        const flightTime = clamp(0.9 + (target.x - start.x) * 0.035, 0.94, 1.08);
+
+        phase = "shot";
+        phaseTime = 0;
+        ball.mode = "free";
+        ball.flight = "shot";
+        setBall(start.x, start.y);
+        ball.vx = (target.x - start.x) / flightTime;
+        ball.vy = (target.y - start.y + 0.5 * G * flightTime * flightTime) / flightTime;
+        ball.spin = -ball.vx / BALL_RADIUS * 0.36;
+      }
+
+      function resolveCircleVsPoint(cx, cy, radius, px, py, restitution) {
+        const dx = cx - px;
+        const dy = cy - py;
+        const dist = Math.hypot(dx, dy);
+        const minDist = radius + court.rimTube;
+        if (dist >= minDist || dist === 0) return false;
+
+        const nx = dx / dist;
+        const ny = dy / dist;
+        const penetration = minDist - dist;
+        ball.x += nx * penetration;
+        ball.y += ny * penetration;
+
+        const normalSpeed = ball.vx * nx + ball.vy * ny;
+        if (normalSpeed < 0) {
+          const impulse = -(1 + restitution) * normalSpeed * BALL_MASS;
+          ball.vx += impulse * nx / BALL_MASS;
+          ball.vy += impulse * ny / BALL_MASS;
+          ball.spin += (nx * ball.vy - ny * ball.vx) * 0.7;
+        }
+        return true;
+      }
+
+      function resolveCircleVsRect(left, bottom, right, top, restitution) {
+        const closestX = clamp(ball.x, left, right);
+        const closestY = clamp(ball.y, bottom, top);
+        let dx = ball.x - closestX;
+        let dy = ball.y - closestY;
+        let distSq = dx * dx + dy * dy;
+        if (distSq >= BALL_RADIUS * BALL_RADIUS) return false;
+
+        let dist = Math.sqrt(distSq);
+        let nx;
+        let ny;
+
+        if (dist > 0.0001) {
+          nx = dx / dist;
+          ny = dy / dist;
+        } else {
+          const distances = [
+            { value: Math.abs(ball.x - left), nx: -1, ny: 0 },
+            { value: Math.abs(right - ball.x), nx: 1, ny: 0 },
+            { value: Math.abs(ball.y - bottom), nx: 0, ny: -1 },
+            { value: Math.abs(top - ball.y), nx: 0, ny: 1 }
+          ].sort((a, b) => a.value - b.value);
+          nx = distances[0].nx;
+          ny = distances[0].ny;
+          dist = 0;
+        }
+
+        const penetration = BALL_RADIUS - dist;
+        ball.x += nx * penetration;
+        ball.y += ny * penetration;
+
+        const normalSpeed = ball.vx * nx + ball.vy * ny;
+        if (normalSpeed < 0) {
+          const impulse = -(1 + restitution) * normalSpeed * BALL_MASS;
+          ball.vx += impulse * nx / BALL_MASS;
+          ball.vy += impulse * ny / BALL_MASS;
+          ball.spin *= 0.88;
+        }
+        return true;
+      }
+
+      function updateBallPhysics(dt) {
+        ball.prevX = ball.x;
+        ball.prevY = ball.y;
+
+        const gravityForce = -BALL_MASS * G;
+        let forceX = 0;
+        let forceY = gravityForce;
+
+        if (ball.flight !== "shot") {
+          const speed = Math.hypot(ball.vx, ball.vy);
+          const drag = 0.0028 * speed;
+          forceX -= drag * ball.vx;
+          forceY -= drag * ball.vy;
+        }
+
+        if (scored && ball.y < court.rimY && ball.y > court.rimY - 0.9 &&
+            Math.abs(ball.x - court.hoopX) < 0.34) {
+          forceX -= ball.vx * 0.36;
+          forceY -= ball.vy * 0.12;
+        }
+
+        ball.vx += forceX / BALL_MASS * dt;
+        ball.vy += forceY / BALL_MASS * dt;
+        ball.x += ball.vx * dt;
+        ball.y += ball.vy * dt;
+        ball.angle += ball.spin * dt;
+
+        if (ball.y - BALL_RADIUS < 0) {
+          ball.y = BALL_RADIUS;
+          if (ball.vy < 0) {
+            const impact = -ball.vy;
+            ball.vy = impact < 0.72 ? 0 : impact * FLOOR_RESTITUTION;
+            ball.vx *= 0.984;
+            ball.spin = lerp(ball.spin, -ball.vx / BALL_RADIUS, 0.34);
+            if (ball.flight === "dribble") dribbleHits += 1;
+          }
+        }
+
+        resolveCircleVsRect(
+          court.boardX - 0.025,
+          court.boardBottom,
+          court.boardX + 0.025,
+          court.boardTop,
+          BOARD_RESTITUTION
+        );
+
+        resolveCircleVsPoint(
+          ball.x,
+          ball.y,
+          BALL_RADIUS,
+          court.hoopX - court.rimHalfWidth,
+          court.rimY,
+          RIM_RESTITUTION
+        );
+        resolveCircleVsPoint(
+          ball.x,
+          ball.y,
+          BALL_RADIUS,
+          court.hoopX + court.rimHalfWidth,
+          court.rimY,
+          RIM_RESTITUTION
+        );
+
+        resolveCircleVsRect(
+          court.baseX,
+          0,
+          court.baseX + 0.28,
+          0.95,
+          0.86
+        );
+
+        if (!scored &&
+            ball.prevY > court.rimY + 0.01 &&
+            ball.y <= court.rimY + 0.01 &&
+            ball.vy < 0 &&
+            Math.abs(ball.x - court.hoopX) < court.rimHalfWidth - BALL_RADIUS * 0.62) {
+          scored = true;
+          netEnergy = 1;
+          netClock = 0;
+        }
+      }
+
+      function fixedUpdate(dt) {
+        phaseTime += dt;
+        netClock += dt;
+        netEnergy *= Math.exp(-2.7 * dt);
+
+        if (phase === "dribble") {
+          if (ball.mode === "free") {
+            updateBallPhysics(dt);
+            ball.vx += (playerA.x + 0.34 - ball.x) * 18 * dt;
+
+            const pose = getPose(playerA, "A");
+            const hand = pose.rightHand;
+            const dx = ball.x - hand.x;
+            const dy = ball.y - hand.y;
+            if (phaseTime < 1.1 &&
+                ball.vy > 0 &&
+                dx * dx + dy * dy < 0.12 &&
+                ball.y > 0.82) {
+              ball.vy = -4.15;
+              ball.vx += (playerA.x + 0.34 - ball.x) * 2.2;
+              ball.spin = -2.6;
+            }
+          }
+
+          if (phaseTime > 1.12) {
+            ball.mode = "heldA";
+            ball.flight = "held";
+            const pose = getPose(playerA, "A");
+            const hold = handCenter(pose);
+            ball.x = hold.x;
+            ball.y = hold.y;
+            ball.vx = 0;
+            ball.vy = 0;
+          }
+
+          if (phaseTime > 1.5) releasePass();
+        } else if (phase === "pass") {
+          updateBallPhysics(dt);
+          const catchPoint = { x: playerB.x - 0.22, y: 1.33 };
+          if (phaseTime >= passDuration ||
+              Math.hypot(ball.x - catchPoint.x, ball.y - catchPoint.y) < 0.2) {
+            beginGather();
+          }
+        } else if (phase === "gather") {
+          const pose = getPose(playerB, "B");
+          const t = smooth(phaseTime / 0.62);
+          const target = {
+            x: pose.shoulder.x + lerp(-0.02, 0.23, t),
+            y: pose.shoulder.y + lerp(-0.34, 0.06, t)
+          };
+          ball.x = target.x;
+          ball.y = target.y;
+          ball.angle += 0.8 * dt;
+          if (phaseTime > 0.62) beginJump();
+        } else if (phase === "jump") {
+          shotClock += dt;
+          const pose = getPose(playerB, "B");
+          const lift = smooth(clamp(shotClock / 0.2, 0, 1));
+          ball.x = pose.shoulder.x + lerp(0.21, 0.34, lift);
+          ball.y = pose.shoulder.y + lerp(-0.02, 0.39, lift);
+          ball.angle += 0.55 * dt;
+          if (shotClock >= 0.205) releaseShot();
+        } else if (phase === "shot") {
+          shotClock += dt;
+          updateBallPhysics(dt);
+          if (scored && ball.y < court.rimY - 0.34) {
+            phase = "return";
+            phaseTime = 0;
+            ball.flight = "return";
+          }
+        } else if (phase === "return") {
+          shotClock += dt;
+          updateBallPhysics(dt);
+
+          if (ball.vx < 0 &&
+              ball.x < playerA.x + 0.55 &&
+              ball.y < 1.38 &&
+              phaseTime > 1.2) {
+            phase = "catchReturn";
+            phaseTime = 0;
+            ball.mode = "heldA";
+            ball.vx = 0;
+            ball.vy = 0;
+          } else if (phaseTime > 7.2) {
+            phase = "catchReturn";
+            phaseTime = 0;
+            ball.mode = "heldA";
+          }
+        } else if (phase === "catchReturn") {
+          const pose = getPose(playerA, "A");
+          const target = handCenter(pose);
+          ball.x = lerp(ball.x, target.x, 0.2);
+          ball.y = lerp(ball.y, target.y, 0.2);
+          ball.angle += ball.spin * dt * Math.exp(-phaseTime * 4);
+          if (phaseTime > 0.58) resetScene();
+        }
+      }
+
+      function solveIK(origin, target, upper, lower, bend) {
+        const dx = target.x - origin.x;
+        const dy = target.y - origin.y;
+        const rawDistance = Math.hypot(dx, dy);
+        const distance = clamp(rawDistance, Math.abs(upper - lower) + 0.001, upper + lower - 0.001);
+        const base = Math.atan2(dy, dx);
+        const cosine = clamp(
+          (upper * upper + distance * distance - lower * lower) /
+          (2 * upper * distance),
+          -1,
+          1
+        );
+        const offset = Math.acos(cosine) * bend;
+        return {
+          x: origin.x + Math.cos(base + offset) * upper,
+          y: origin.y + Math.sin(base + offset) * upper
+        };
+      }
+
+      function clampReach(origin, target, maxReach) {
+        const dx = target.x - origin.x;
+        const dy = target.y - origin.y;
+        const distance = Math.hypot(dx, dy);
+        if (distance <= maxReach || distance < 0.0001) return target;
+        const ratio = maxReach / distance;
+        return {
+          x: origin.x + dx * ratio,
+          y: origin.y + dy * ratio
+        };
+      }
+
+      function pathCapsule(a, b, width, color) {
+        const p1 = worldToScreen(a.x, a.y);
+        const p2 = worldToScreen(b.x, b.y);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = Math.max(1, width * view.scale);
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+      }
+
+      function fillWorldCircle(point, radius, color) {
+        const p = worldToScreen(point.x, point.y);
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, radius * view.scale, 0, TAU);
+        ctx.fill();
+      }
+
+      function drawLimb(origin, joint, end, width, color) {
+        pathCapsule(origin, joint, width, color);
+        pathCapsule(joint, end, width * 0.9, color);
+        fillWorldCircle(joint, width * 0.48, color);
+      }
+
+      function drawShoe(foot, facing, color) {
+        const p = worldToScreen(foot.x, foot.y);
+        const s = view.scale;
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.scale(facing, 1);
+        ctx.fillStyle = color;
+        ctx.strokeStyle = "rgba(25, 35, 42, 0.22)";
+        ctx.lineWidth = Math.max(0.8, s * 0.012);
+        ctx.beginPath();
+        ctx.roundRect(-0.06 * s, -0.035 * s, 0.26 * s, 0.105 * s, 0.04 * s);
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function drawPlayerShadow(pose) {
+        const p = worldToScreen(pose.rootX, 0);
+        const liftFade = clamp(1 - pose.jump * 0.85, 0.35, 1);
+        ctx.save();
+        ctx.fillStyle = `rgba(43, 34, 24, ${0.16 * liftFade})`;
+        ctx.beginPath();
+        ctx.ellipse(
+          p.x,
+          p.y + 2,
+          view.scale * (0.36 + pose.jump * 0.16),
+          view.scale * 0.075,
+          0,
+          0,
+          TAU
+        );
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function drawPlayer(player, pose, role) {
+        const hipL = { x: pose.hip.x - 0.1, y: pose.hip.y };
+        const hipR = { x: pose.hip.x + 0.1, y: pose.hip.y };
+        const rearKnee = solveIK(hipL, pose.rearFoot, 0.46, 0.47, role === "A" ? -1 : 1);
+        const frontKnee = solveIK(hipR, pose.frontFoot, 0.46, 0.47, 1);
+
+        drawLimb(hipL, rearKnee, pose.rearFoot, 0.13, player.skin);
+        drawShoe(pose.rearFoot, player.facing, player.shoe);
+
+        drawLimb(hipR, frontKnee, pose.frontFoot, 0.14, player.skin);
+        drawShoe(pose.frontFoot, player.facing, player.shoe);
+
+        const torsoTopLeft = worldToScreen(pose.shoulder.x - 0.2, pose.shoulder.y + 0.04);
+        const torsoTopRight = worldToScreen(pose.shoulder.x + 0.2, pose.shoulder.y + 0.04);
+        const torsoBottomRight = worldToScreen(pose.hip.x + 0.17, pose.hip.y + 0.05);
+        const torsoBottomLeft = worldToScreen(pose.hip.x - 0.17, pose.hip.y + 0.05);
+
+        ctx.fillStyle = player.jersey;
+        ctx.beginPath();
+        ctx.moveTo(torsoTopLeft.x, torsoTopLeft.y);
+        ctx.quadraticCurveTo(
+          (torsoTopLeft.x + torsoTopRight.x) * 0.5,
+          torsoTopLeft.y - view.scale * 0.035,
+          torsoTopRight.x,
+          torsoTopRight.y
+        );
+        ctx.lineTo(torsoBottomRight.x, torsoBottomRight.y);
+        ctx.lineTo(torsoBottomLeft.x, torsoBottomLeft.y);
+        ctx.closePath();
+        ctx.fill();
+
+        const highlightA = worldToScreen(pose.shoulder.x - 0.105, pose.shoulder.y);
+        const highlightB = worldToScreen(pose.hip.x - 0.08, pose.hip.y + 0.12);
+        ctx.strokeStyle = player.jerseyLight;
+        ctx.lineWidth = Math.max(1.2, view.scale * 0.035);
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(highlightA.x, highlightA.y);
+        ctx.lineTo(highlightB.x, highlightB.y);
+        ctx.stroke();
+
+        const shortsTop = worldToScreen(pose.hip.x - 0.19, pose.hip.y + 0.12);
+        const shortsRight = worldToScreen(pose.hip.x + 0.19, pose.hip.y + 0.12);
+        const shortsBottomR = worldToScreen(pose.hip.x + 0.15, pose.hip.y - 0.12);
+        const shortsBottomL = worldToScreen(pose.hip.x - 0.15, pose.hip.y - 0.12);
+        ctx.fillStyle = player.shorts;
+        ctx.beginPath();
+        ctx.moveTo(shortsTop.x, shortsTop.y);
+        ctx.lineTo(shortsRight.x, shortsRight.y);
+        ctx.lineTo(shortsBottomR.x, shortsBottomR.y);
+        ctx.lineTo(worldToScreen(pose.hip.x, pose.hip.y - 0.05).x, worldToScreen(pose.hip.x, pose.hip.y - 0.05).y);
+        ctx.lineTo(shortsBottomL.x, shortsBottomL.y);
+        ctx.closePath();
+        ctx.fill();
+
+        const shoulderL = { x: pose.shoulder.x - 0.16, y: pose.shoulder.y };
+        const shoulderR = { x: pose.shoulder.x + 0.16, y: pose.shoulder.y };
+        const leftHand = clampReach(shoulderL, pose.leftHand, 0.64);
+        const rightHand = clampReach(shoulderR, pose.rightHand, 0.64);
+        const elbowL = solveIK(shoulderL, leftHand, 0.34, 0.33, -1);
+        const elbowR = solveIK(shoulderR, rightHand, 0.34, 0.33, 1);
+
+        drawLimb(shoulderL, elbowL, leftHand, 0.105, player.skin);
+        drawLimb(shoulderR, elbowR, rightHand, 0.105, player.skin);
+        fillWorldCircle(leftHand, 0.075, player.skin);
+        fillWorldCircle(rightHand, 0.075, player.skin);
+
+        fillWorldCircle(pose.head, 0.165, player.skin);
+
+        const hair = worldToScreen(pose.head.x - 0.02, pose.head.y + 0.075);
+        ctx.fillStyle = palette.dark;
+        ctx.beginPath();
+        ctx.arc(hair.x, hair.y, 0.145 * view.scale, Math.PI * 1.04, Math.PI * 1.94);
+        ctx.quadraticCurveTo(
+          hair.x + 0.14 * view.scale,
+          hair.y - 0.08 * view.scale,
+          hair.x + 0.13 * view.scale,
+          hair.y + 0.015 * view.scale
+        );
+        ctx.fill();
+
+        const nose = worldToScreen(pose.head.x + 0.155, pose.head.y + 0.01);
+        ctx.fillStyle = player.skin;
+        ctx.beginPath();
+        ctx.arc(nose.x, nose.y, 0.035 * view.scale, 0, TAU);
+        ctx.fill();
+      }
+
+      function drawBackground() {
+        const gradient = ctx.createLinearGradient(0, 0, 0, view.groundY);
+        gradient.addColorStop(0, palette.skyTop);
+        gradient.addColorStop(1, palette.skyBottom);
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, view.width, view.height);
+
+        ctx.strokeStyle = "rgba(117, 125, 128, 0.09)";
+        ctx.lineWidth = 1;
+        const horizon = view.groundY - 2.1 * view.scale;
+        ctx.beginPath();
+        ctx.moveTo(0, horizon);
+        ctx.lineTo(view.width, horizon);
+        ctx.stroke();
+
+        for (const grain of backgroundGrain) {
+          ctx.fillStyle = "rgba(60, 54, 45, 0.035)";
+          ctx.beginPath();
+          ctx.arc(
+            grain.x * view.width,
+            grain.y * Math.max(1, view.groundY - 8),
+            grain.r,
+            0,
+            TAU
+          );
+          ctx.fill();
+        }
+      }
+
+      function drawCourt() {
+        const floorGradient = ctx.createLinearGradient(0, view.groundY, 0, view.height);
+        floorGradient.addColorStop(0, palette.courtLight);
+        floorGradient.addColorStop(1, palette.court);
+        ctx.fillStyle = floorGradient;
+        ctx.fillRect(0, view.groundY, view.width, view.height - view.groundY);
+
+        ctx.strokeStyle = "rgba(116, 70, 30, 0.16)";
+        ctx.lineWidth = 1;
+        const plankHeight = Math.max(13, view.scale * 0.22);
+        for (let y = view.groundY + plankHeight; y < view.height; y += plankHeight) {
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(view.width, y);
+          ctx.stroke();
+        }
+
+        const boardWidth = Math.max(52, view.scale * 0.88);
+        for (let row = 0, y = view.groundY; y < view.height + plankHeight; row++, y += plankHeight) {
+          const shift = (row % 2) * boardWidth * 0.5;
+          for (let x = -shift; x < view.width; x += boardWidth) {
+            ctx.strokeStyle = "rgba(126, 76, 34, 0.12)";
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(x + view.scale * 0.04, Math.min(view.height, y + plankHeight));
+            ctx.stroke();
+          }
+        }
+
+        ctx.strokeStyle = palette.courtInk;
+        ctx.lineWidth = Math.max(1.2, view.scale * 0.025);
+        ctx.beginPath();
+        ctx.moveTo(0, view.groundY + 0.8);
+        ctx.lineTo(view.width, view.groundY + 0.8);
+        ctx.stroke();
+
+        const hoop = worldToScreen(court.hoopX, 0);
+        ctx.save();
+        ctx.strokeStyle = "rgba(250, 247, 239, 0.8)";
+        ctx.lineWidth = Math.max(1.5, view.scale * 0.035);
+        ctx.beginPath();
+        ctx.ellipse(
+          hoop.x - view.scale * 1.34,
+          view.groundY + view.scale * 0.24,
+          view.scale * 1.55,
+          view.scale * 0.34,
+          0,
+          Math.PI,
+          TAU
+        );
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(hoop.x - view.scale * 3.55, view.groundY);
+        ctx.lineTo(hoop.x - view.scale * 3.55, view.height);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function drawHoopBehind() {
+        const baseLeft = worldToScreen(court.baseX, 0);
+        const supportTop = worldToScreen(court.boardX + 0.02, 3.54);
+        const supportBend = worldToScreen(court.baseX + 0.1, 2.28);
+
+        ctx.strokeStyle = palette.metal;
+        ctx.lineWidth = Math.max(2.5, view.scale * 0.085);
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(baseLeft.x, baseLeft.y);
+        ctx.lineTo(supportBend.x, supportBend.y);
+        ctx.lineTo(supportTop.x, supportTop.y);
+        ctx.stroke();
+
+        const baseBottom = worldToScreen(court.baseX + 0.28, 0);
+        const baseTop = worldToScreen(court.baseX, 0.95);
+        ctx.fillStyle = palette.navy;
+        ctx.beginPath();
+        ctx.moveTo(baseLeft.x - view.scale * 0.03, baseLeft.y);
+        ctx.lineTo(baseBottom.x, baseBottom.y);
+        ctx.lineTo(baseBottom.x - view.scale * 0.03, baseTop.y);
+        ctx.lineTo(baseTop.x, baseTop.y);
+        ctx.closePath();
+        ctx.fill();
+
+        const boardTL = worldToScreen(court.boardX - 0.03, court.boardTop);
+        const boardBR = worldToScreen(court.boardX + 0.03, court.boardBottom);
+        ctx.fillStyle = "rgba(235, 244, 246, 0.46)";
+        ctx.strokeStyle = palette.metal;
+        ctx.lineWidth = Math.max(1.5, view.scale * 0.035);
+        ctx.fillRect(
+          boardTL.x - view.scale * 0.54,
+          boardTL.y,
+          view.scale * 0.6,
+          boardBR.y - boardTL.y
+        );
+        ctx.strokeRect(
+          boardTL.x - view.scale * 0.54,
+          boardTL.y,
+          view.scale * 0.6,
+          boardBR.y - boardTL.y
+        );
+
+        const squareTL = worldToScreen(court.boardX - 0.035, 3.55);
+        ctx.strokeStyle = "rgba(91, 100, 105, 0.62)";
+        ctx.lineWidth = Math.max(1, view.scale * 0.02);
+        ctx.strokeRect(
+          squareTL.x - view.scale * 0.32,
+          squareTL.y,
+          view.scale * 0.32,
+          view.scale * 0.37
+        );
+      }
+
+      function drawNetAndRim() {
+        const left = worldToScreen(court.hoopX - court.rimHalfWidth, court.rimY);
+        const right = worldToScreen(court.hoopX + court.rimHalfWidth, court.rimY);
+        const sway = Math.sin(netClock * 13.2) * netEnergy;
+        const kick = Math.sin(netClock * 8.4) * netEnergy;
+        const netBottom = worldToScreen(
+          court.hoopX + sway * 0.1,
+          court.rimY - 0.62 - Math.abs(kick) * 0.05
+        );
+
+        ctx.strokeStyle = "rgba(121, 126, 122, 0.65)";
+        ctx.lineWidth = Math.max(0.75, view.scale * 0.012);
+        ctx.lineCap = "round";
+
+        const strands = 7;
+        for (let i = 0; i < strands; i++) {
+          const t = i / (strands - 1);
+          const topX = lerp(left.x, right.x, t);
+          const bottomX = lerp(
+            netBottom.x - view.scale * 0.105,
+            netBottom.x + view.scale * 0.105,
+            t
+          );
+          ctx.beginPath();
+          ctx.moveTo(topX, left.y + view.scale * 0.025);
+          ctx.quadraticCurveTo(
+            lerp(topX, bottomX, 0.5) + sway * view.scale * (0.025 + t * 0.018),
+            lerp(left.y, netBottom.y, 0.48),
+            bottomX,
+            netBottom.y
+          );
+          ctx.stroke();
+        }
+
+        for (let row = 1; row <= 4; row++) {
+          const t = row / 5;
+          const width = lerp(right.x - left.x, view.scale * 0.21, t);
+          const centerX = lerp((left.x + right.x) * 0.5, netBottom.x, t);
+          const y = lerp(left.y, netBottom.y, t);
+          ctx.beginPath();
+          ctx.moveTo(centerX - width * 0.5, y);
+          ctx.quadraticCurveTo(centerX + sway * view.scale * 0.04, y + 2, centerX + width * 0.5, y);
+          ctx.stroke();
+        }
+
+        ctx.strokeStyle = palette.rim;
+        ctx.lineWidth = Math.max(2.5, view.scale * court.rimTube * 2);
+        ctx.beginPath();
+        ctx.moveTo(left.x, left.y);
+        ctx.lineTo(right.x, right.y);
+        ctx.stroke();
+
+        ctx.fillStyle = palette.rim;
+        ctx.beginPath();
+        ctx.arc(left.x, left.y, view.scale * court.rimTube, 0, TAU);
+        ctx.arc(right.x, right.y, view.scale * court.rimTube, 0, TAU);
+        ctx.fill();
+      }
+
+      function drawBallShadow() {
+        const p = worldToScreen(ball.x, 0);
+        const heightFade = clamp(1 - ball.y / 4.8, 0.18, 0.92);
+        const radius = view.scale * BALL_RADIUS * (1.25 + ball.y * 0.12);
+        ctx.fillStyle = `rgba(44, 31, 21, ${0.19 * heightFade})`;
+        ctx.beginPath();
+        ctx.ellipse(p.x, p.y + 2, radius, radius * 0.34, 0, 0, TAU);
+        ctx.fill();
+      }
+
+      function drawBall() {
+        const p = worldToScreen(ball.x, ball.y);
+        const r = BALL_RADIUS * view.scale;
+        const gradient = ctx.createRadialGradient(
+          p.x - r * 0.34,
+          p.y - r * 0.42,
+          r * 0.08,
+          p.x,
+          p.y,
+          r
+        );
+        gradient.addColorStop(0, "#f29a4f");
+        gradient.addColorStop(0.62, palette.ball);
+        gradient.addColorStop(1, "#b95224");
+
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(ball.angle);
+        ctx.fillStyle = gradient;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, TAU);
+        ctx.fill();
+
+        ctx.strokeStyle = palette.ballDark;
+        ctx.lineWidth = Math.max(0.8, r * 0.085);
+        ctx.beginPath();
+        ctx.arc(0, 0, r * 0.98, 0, TAU);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(-r, 0);
+        ctx.bezierCurveTo(-r * 0.35, -r * 0.22, r * 0.35, -r * 0.22, r, 0);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(0, -r);
+        ctx.bezierCurveTo(r * 0.24, -r * 0.35, r * 0.24, r * 0.35, 0, r);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(-r * 0.62, 0, r * 0.72, -Math.PI * 0.5, Math.PI * 0.5);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function render() {
+        ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+        ctx.clearRect(0, 0, view.width, view.height);
+
+        drawBackground();
+        drawCourt();
+        drawHoopBehind();
+
+        const poseA = getPose(playerA, "A");
+        const poseB = getPose(playerB, "B");
+
+        drawPlayerShadow(poseA);
+        drawPlayerShadow(poseB);
+        drawBallShadow();
+
+        drawPlayer(playerA, poseA, "A");
+        drawPlayer(playerB, poseB, "B");
+        drawBall();
+        drawNetAndRim();
+      }
+
+      function frame(timestamp) {
+        const elapsed = Math.min((timestamp - previousTimestamp) / 1000, 0.08);
+        previousTimestamp = timestamp;
+        accumulator += elapsed;
+
+        let steps = 0;
+        while (accumulator >= FIXED_DT && steps < 10) {
+          fixedUpdate(FIXED_DT);
+          accumulator -= FIXED_DT;
+          steps += 1;
+        }
+
+        render();
+        requestAnimationFrame(frame);
+      }
+
+      window.addEventListener("resize", resize, { passive: true });
+      resize();
+      requestAnimationFrame(frame);
+    })();
+  </script>
+</body>
+</html>
